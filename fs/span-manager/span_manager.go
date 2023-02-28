@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -41,7 +40,7 @@ const (
 	unrequested spanState = iota
 	// A span is in Requested state when it's requested from remote but its content hasn't been returned.
 	requested
-	// A span is in Fetched state when its content is fetched from remote.
+	// A span is in Fetched state when its content is fetched from remote and compressed data is cached.
 	fetched
 	// A span is in Uncompressed state when it's uncompressed and its uncompressed content is cached.
 	uncompressed
@@ -52,14 +51,29 @@ const (
 	defaultSpanVerificationFailureRetries = 3
 )
 
-// map of valid span transtions. Key is the current state and value is valid new states.
+// map of valid span transtions: current state -> valid new states.
+// stateTransitionMap is kept minimum so we won't change state by accident.
+// We should keep it documented when each transition will happen.
 var stateTransitionMap = map[spanState][]spanState{
-	unrequested:  {unrequested, requested},
-	requested:    {requested, fetched},
-	fetched:      {fetched, uncompressed},
-	uncompressed: {uncompressed},
+	unrequested: {
+		// when span starts being fetched; it makes other goroutines aware of this
+		requested,
+	},
+	requested: {
+		// when a span fetch fails; change back to unrequested so other goroutines can request again
+		unrequested,
+		// when bg-fetcher fetches and caches compressed span
+		fetched,
+		// when span data request comes; span is fetched, uncompressed and cached
+		uncompressed,
+	},
+	fetched: {
+		// when span data request comes and span is fetched by bg-fetcher; compressed span is available in cache
+		uncompressed,
+	},
 }
 
+// Specific error types raised by SpanManager.
 var (
 	ErrSpanNotAvailable           = errors.New("span not available in cache")
 	ErrIncorrectSpanDigest        = errors.New("span digests do not match")
@@ -75,6 +89,11 @@ type span struct {
 	endUncompOffset   compression.Offset
 	state             atomic.Value
 	mu                sync.Mutex
+}
+
+func (s *span) checkState(expected spanState) bool {
+	state := s.state.Load().(spanState)
+	return state == expected
 }
 
 func (s *span) setState(state spanState) error {
@@ -93,9 +112,10 @@ func (s *span) validateStateTransition(newState spanState) error {
 			return nil
 		}
 	}
-	return errInvalidSpanStateTransition
+	return fmt.Errorf("%w: %v -> %v", errInvalidSpanStateTransition, state, newState)
 }
 
+// SpanManager fetches and caches spans of a given layer.
 type SpanManager struct {
 	cache                             cache.BlobCache
 	cacheOpt                          []cache.Option
@@ -119,6 +139,8 @@ type spanInfo struct {
 	spanIndexInBuf []compression.Offset
 }
 
+// New creates a SpanManager with given ztoc and content reader, and builds all
+// spans based on the ztoc.
 func New(ztoc *ztoc.Ztoc, r *io.SectionReader, cache cache.BlobCache, retries int, cacheOpt ...cache.Option) *SpanManager {
 	index, err := compression.NewGzipZinfo(ztoc.CompressionInfo.Checkpoints)
 	if err != nil {
@@ -173,103 +195,47 @@ func (m *SpanManager) buildAllSpans() {
 	}
 }
 
-// fetchWithRetries fetches the requested data and verifies that the span digest matches the one in the ztoc m.retries times.
-// It does not retry when there is an error fetching the data, because retries already happen lower in the stack in httpFetcher.
-// If there is an error fetching data from remote, it is not an transient error.
-func (m *SpanManager) fetchWithRetries(spanID compression.SpanID, buf []byte, offset compression.Offset) error {
-	var (
-		err error
-		n   int
-	)
-	for i := 0; i < m.maxSpanVerificationFailureRetries+1; i++ {
-		n, err = m.r.ReadAt(buf, int64(offset))
-		if err != nil {
-			return err
-		}
-
-		if n != len(buf) {
-			return fmt.Errorf("unexpected data size for reading compressed span. read = %d, expected = %d", n, len(buf))
-		}
-
-		if err = m.verifySpanContents(buf, spanID); err != nil {
-			continue
-		}
-		return nil
-	}
-	return err
-}
-
-// FetchSingleSpan invokes the reader to fetch the span in the background and cache it.
-// It is invoked by the BackgroundFetcher.
+// FetchSingleSpan invokes the reader to fetch the span in the background and cache
+// the span without uncompressing. It is invoked by the BackgroundFetcher.
+// span state change: unrequested -> requested -> fetched.
 func (m *SpanManager) FetchSingleSpan(spanID compression.SpanID) error {
 	if spanID > m.ztoc.CompressionInfo.MaxSpanID {
 		return ErrExceedMaxSpan
 	}
 
+	// return directly if span is not in `unrequested`
 	s := m.spans[spanID]
-	s.mu.Lock()
-	state := s.state.Load().(spanState)
-
-	// Only fetch if the span hasn't been requested yet.
-	if state != unrequested {
-		s.mu.Unlock()
+	if !s.checkState(unrequested) {
 		return nil
-	}
-
-	s.setState(requested)
-	s.mu.Unlock()
-
-	compressedSize := s.endCompOffset - s.startCompOffset
-	compressedBuf := make([]byte, compressedSize)
-
-	if err := m.fetchWithRetries(spanID, compressedBuf, s.startCompOffset); err != nil {
-		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	state = s.state.Load().(spanState)
-	if state != requested {
+	// check again after acquiring Lock
+	if !s.checkState(unrequested) {
 		return nil
 	}
 
-	m.addSpanToCache(fmt.Sprintf("%d", spanID), compressedBuf)
-	return s.setState(fetched)
+	_, err := m.fetchAndCacheSpan(spanID, false)
+	return err
 }
 
-func (m *SpanManager) ResolveSpan(spanID compression.SpanID) error {
+// resolveSpan ensures the span exists in cache and is uncompressed by calling
+// `getSpanContent`. Only for testing.
+func (m *SpanManager) resolveSpan(spanID compression.SpanID) error {
 	if spanID > m.ztoc.CompressionInfo.MaxSpanID {
 		return ErrExceedMaxSpan
 	}
 
-	// Check if the span exists in the cache
-	s := m.spans[spanID]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	state := s.state.Load().(spanState)
-	if state == uncompressed {
-		id := strconv.Itoa(int(spanID))
-		_, err := m.cache.Get(id)
-		if err == nil {
-			// The span is already in cache.
-			return nil
-		}
-	}
-
-	// The span is not available in cache. Fetch the span and add it to cache
-	_, err := m.fetchAndCacheSpan(spanID)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	// this func itself doesn't use the returned span data
+	_, err := m.getSpanContent(spanID, 0, m.spans[spanID].endUncompOffset)
+	return err
 }
 
-// GetContents returns a reader for the requested contents.
-// offsetStart and offsetEnd are start and end uncompressed offsets of the file.
-func (m *SpanManager) GetContents(offsetStart, offsetEnd compression.Offset) (io.Reader, error) {
-	si := m.getSpanInfo(offsetStart, offsetEnd)
+// GetContents returns a reader for the requested contents. The contents may be
+// across multiple spans.
+func (m *SpanManager) GetContents(startUncompOffset, endUncompOffset compression.Offset) (io.Reader, error) {
+	si := m.getSpanInfo(startUncompOffset, endUncompOffset)
 	numSpans := si.spanEnd - si.spanStart + 1
 	spanReaders := make([]io.Reader, numSpans)
 
@@ -278,9 +244,8 @@ func (m *SpanManager) GetContents(offsetStart, offsetEnd compression.Offset) (io
 	for i = 0; i < numSpans; i++ {
 		j := i
 		eg.Go(func() error {
-			spanContentSize := si.endOffInSpan[j] - si.startOffInSpan[j]
 			spanID := j + si.spanStart
-			r, err := m.GetSpanContent(spanID, si.startOffInSpan[j], si.endOffInSpan[j], spanContentSize)
+			r, err := m.getSpanContent(spanID, si.startOffInSpan[j], si.endOffInSpan[j])
 			if err != nil {
 				return err
 			}
@@ -330,127 +295,156 @@ func (m *SpanManager) getSpanInfo(offsetStart, offsetEnd compression.Offset) *sp
 	return &spanInfo
 }
 
-func (m *SpanManager) GetSpanContent(spanID compression.SpanID, offsetStart, offsetEnd, size compression.Offset) (io.Reader, error) {
-	// Check if we can resolve the span from the cache
+// getSpanContent gets uncompressed span content (specified by [offsetStart:offsetEnd]),
+// which is returned as an `io.Reader`.
+//
+// It resolves the span to ensure it exists and is uncompressed in cache:
+//  1. For `uncompressed` span, directly return the reader from the cache.
+//  2. For `fetched` span, read and uncompress the compressed span from cache, cache and
+//     return the reader from the uncompressed span.
+//  3. For `unrequested` span, fetch-uncompress-cache the span data, return the reader
+//     from the uncompressed span
+//  4. No span state lock will be acquired in `requested` state.
+func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, offsetEnd compression.Offset) (io.Reader, error) {
 	s := m.spans[spanID]
-	r, err := m.resolveSpanFromCache(s, offsetStart, size)
-	if err == nil {
-		return r, nil
-	} else if !errors.Is(err, ErrSpanNotAvailable) {
-		// if the span exists in the cache but resolveSpanFromCache fails, return the error to caller
-		return nil, err
+	size := offsetEnd - offsetStart
+
+	// return from cache directly if cached and uncompressed
+	if s.checkState(uncompressed) {
+		return m.getSpanFromCache(s.id, offsetStart, size)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// retry resolveSpanFromCache in case we raced with another thread
-	r, err = m.resolveSpanFromCache(s, offsetStart, size)
-	if err == nil {
-		return r, nil
-	} else if !errors.Is(err, ErrSpanNotAvailable) {
-		// if the span exists in the cache but resolveSpanFromCache fails, return the error to caller
-		return nil, err
-	}
-	uncompBuf, err := m.fetchAndCacheSpan(spanID)
-	if err != nil {
-		return nil, err
+	// check again after acquiring lock
+	if s.checkState(uncompressed) {
+		return m.getSpanFromCache(s.id, offsetStart, size)
 	}
 
-	buf := bytes.NewBuffer(uncompBuf[offsetStart:offsetEnd])
-	return io.Reader(buf), nil
-}
-
-// getSpanFromCache returns the reader for the contents of the span stored in the cache.
-// offset is the offset of the requested contents within the span. size is the size of the requested contents.
-func (m *SpanManager) getSpanFromCache(spanID string, offset, size compression.Offset) (io.Reader, error) {
-	r, err := m.cache.Get(spanID)
-	if err != nil {
-		return nil, ErrSpanNotAvailable
-	}
-	runtime.SetFinalizer(r, func(r cache.Reader) {
-		r.Close()
-	})
-	return io.NewSectionReader(r, int64(offset), int64(size)), // doing integer type conversion to allow passing offset and size on the reader
-		nil
-}
-
-func (m *SpanManager) verifySpanContents(compressedData []byte, id compression.SpanID) error {
-	actual := digest.FromBytes(compressedData)
-	expected := m.ztoc.CompressionInfo.SpanDigests[id]
-	if actual != expected {
-		return fmt.Errorf("expected %v but got %v: %w", expected, actual, ErrIncorrectSpanDigest)
-	}
-	return nil
-}
-
-// addSpanToCache adds contents of the span to the cache.
-func (m *SpanManager) addSpanToCache(spanID string, contents []byte, opts ...cache.Option) {
-	if w, err := m.cache.Add(spanID, opts...); err == nil {
-		if n, err := w.Write(contents); err != nil || n != len(contents) {
-			w.Abort()
-		} else {
-			w.Commit()
-		}
-		w.Close()
-	}
-}
-
-// resolveSpanFromCache resolves the span (in Fetched/Uncompressed state) from the cache.
-// This method returns the reader for the uncompressed span.
-// For Uncompressed span, directly return the reader from the cache.
-// For Fetched span, get the compressed span from the cache, uncompress it, cache the uncompressed span and
-// returns the reader for the uncompressed span.
-func (m *SpanManager) resolveSpanFromCache(s *span, offsetStart, size compression.Offset) (io.Reader, error) {
-	id := fmt.Sprintf("%d", s.id)
-	state := s.state.Load().(spanState)
-	if state == uncompressed {
-		r, err := m.getSpanFromCache(id, offsetStart, size)
-		if err != nil {
-			return nil, err
-		}
-		return r, nil
-	}
-	if state == fetched {
-		// get the compressed span from the cache
+	// if cached but not uncompressed, uncompress and cache the span content
+	if s.checkState(fetched) {
+		// get compressed span from the cache
 		compressedSize := s.endCompOffset - s.startCompOffset
-		r, err := m.getSpanFromCache(id, 0, compressedSize)
+		r, err := m.getSpanFromCache(s.id, 0, compressedSize)
 		if err != nil {
 			return nil, err
 		}
 
-		// read the compressed span
+		// read compressed span
 		compressedBuf, err := io.ReadAll(r)
 		if err != nil {
 			return nil, err
 		}
 
-		// uncompress the span
+		// uncompress span
 		uncompSpanBuf, err := m.uncompressSpan(s, compressedBuf)
 		if err != nil {
 			return nil, err
 		}
 
-		// cache the uncompressed span
-		m.addSpanToCache(id, uncompSpanBuf, m.cacheOpt...)
-		err = s.setState(uncompressed)
-		if err != nil {
+		// cache uncompressed span
+		if err := m.addSpanToCache(s.id, uncompSpanBuf, m.cacheOpt...); err != nil {
+			return nil, err
+		}
+		if err := s.setState(uncompressed); err != nil {
 			return nil, err
 		}
 		return bytes.NewReader(uncompSpanBuf[offsetStart : offsetStart+size]), nil
 	}
-	return nil, ErrSpanNotAvailable
-}
 
-func (m *SpanManager) fetchSpan(buf []byte, spanID compression.SpanID) error {
-	s := m.spans[spanID]
-	err := s.setState(requested)
+	// fetch-uncompress-cache span: span state can only be `unrequested` since
+	// no goroutine will release span state lock in `requested` state
+	uncompBuf, err := m.fetchAndCacheSpan(s.id, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = m.fetchWithRetries(spanID, buf, s.startCompOffset)
-	return err
+	buf := bytes.NewBuffer(uncompBuf[offsetStart : offsetStart+size])
+	return io.Reader(buf), nil
 }
 
+// fetchAndCacheSpan fetches a span, uncompresses the span if `uncompress == true`,
+// caches and returns the span content. The span state is set to `fetched/uncompressed`,
+// depending on if `uncompress` is enabled.
+// The caller needs to check the span state (e.g. `unrequested`) and acquires the
+// span's state lock before calling.
+func (m *SpanManager) fetchAndCacheSpan(spanID compression.SpanID, uncompress bool) (buf []byte, err error) {
+	s := m.spans[spanID]
+
+	// change to `requested`; if fetch/cache fails, change back to `unrequested`
+	// so other goroutines can request again.
+	if err := s.setState(requested); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil && s.checkState(requested) {
+			s.setState(unrequested)
+		}
+	}()
+
+	// fetch compressed span
+	compressedBuf, err := m.fetchSpanWithRetries(spanID)
+	if err != nil {
+		return nil, err
+	}
+
+	buf = compressedBuf
+	var state = fetched
+
+	if uncompress {
+		// uncompress span
+		uncompSpanBuf, err := m.uncompressSpan(s, compressedBuf)
+		if err != nil {
+			return nil, err
+		}
+		buf = uncompSpanBuf
+		state = uncompressed
+	}
+
+	// cache span data
+	if err := m.addSpanToCache(spanID, buf, m.cacheOpt...); err != nil {
+		return nil, err
+	}
+	if err := s.setState(state); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// fetchSpanWithRetries fetches the requested data and verifies that the span digest matches the one in the ztoc.
+// It will retry the fetch and verification m.maxSpanVerificationFailureRetries times.
+// It does not retry when there is an error fetching the data, because retries already happen lower in the stack in httpFetcher.
+// If there is an error fetching data from remote, it is not an transient error.
+func (m *SpanManager) fetchSpanWithRetries(spanID compression.SpanID) ([]byte, error) {
+	s := m.spans[spanID]
+	offset := s.startCompOffset
+	compressedSize := s.endCompOffset - s.startCompOffset
+	compressedBuf := make([]byte, compressedSize)
+
+	var (
+		err error
+		n   int
+	)
+	for i := 0; i < m.maxSpanVerificationFailureRetries+1; i++ {
+		n, err = m.r.ReadAt(compressedBuf, int64(offset))
+		// if the n = len(p) bytes returned by ReadAt are at the end of the input source,
+		// ReadAt may return either err == EOF or err == nil: https://pkg.go.dev/io#ReaderAt
+		if err != nil && err != io.EOF {
+			return []byte{}, err
+		}
+
+		if n != len(compressedBuf) {
+			return []byte{}, fmt.Errorf("unexpected data size for reading compressed span. read = %d, expected = %d", n, len(compressedBuf))
+		}
+
+		if err = m.verifySpanContents(compressedBuf, spanID); err == nil {
+			return compressedBuf, nil
+		}
+	}
+	return []byte{}, err
+}
+
+// uncompressSpan uses zinfo to extract uncompressed span data from compressed
+// span data.
 func (m *SpanManager) uncompressSpan(s *span, compressedBuf []byte) ([]byte, error) {
 	uncompSize := s.endUncompOffset - s.startUncompOffset
 
@@ -466,32 +460,48 @@ func (m *SpanManager) uncompressSpan(s *span, compressedBuf []byte) ([]byte, err
 	return bytes, nil
 }
 
-func (m *SpanManager) fetchAndCacheSpan(spanID compression.SpanID) ([]byte, error) {
-	s := m.spans[spanID]
-	compressedSize := s.endCompOffset - s.startCompOffset
-	compressedBuf := make([]byte, compressedSize)
-	err := m.fetchSpan(compressedBuf, spanID)
-	if err != nil && err != io.EOF {
-		return nil, err
+// addSpanToCache adds contents of the span to the cache.
+// A non-nil error is returned if the data is not written to the cache.
+func (m *SpanManager) addSpanToCache(spanID compression.SpanID, contents []byte, opts ...cache.Option) error {
+	w, err := m.cache.Add(fmt.Sprintf("%d", spanID), opts...)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+
+	_, err = w.Write(contents)
+	if err != nil {
+		w.Abort()
+		return err
 	}
 
-	err = s.setState(fetched)
-	if err != nil {
-		return nil, err
-	}
+	w.Commit()
+	return nil
+}
 
-	uncompSpanBuf, err := m.uncompressSpan(s, compressedBuf)
+// getSpanFromCache returns the cached span content as an `io.Reader`.
+// `offset` is the offset of the requested contents within the span.
+// `size` is the size of the requested contents.
+func (m *SpanManager) getSpanFromCache(spanID compression.SpanID, offset, size compression.Offset) (io.Reader, error) {
+	r, err := m.cache.Get(fmt.Sprintf("%d", spanID))
 	if err != nil {
-		return nil, err
+		return nil, ErrSpanNotAvailable
 	}
+	runtime.SetFinalizer(r, func(r cache.Reader) {
+		r.Close()
+	})
+	return io.NewSectionReader(r, int64(offset), int64(size)), nil
+}
 
-	// Cache the content of the whole span
-	m.addSpanToCache(fmt.Sprintf("%d", spanID), uncompSpanBuf, m.cacheOpt...)
-	err = s.setState(uncompressed)
-	if err != nil {
-		return nil, err
+// verifySpanContents caculates span digest from its compressed bytes, and compare
+// with the digest stored in ztoc.
+func (m *SpanManager) verifySpanContents(compressedData []byte, spanID compression.SpanID) error {
+	actual := digest.FromBytes(compressedData)
+	expected := m.ztoc.CompressionInfo.SpanDigests[spanID]
+	if actual != expected {
+		return fmt.Errorf("expected %v but got %v: %w", expected, actual, ErrIncorrectSpanDigest)
 	}
-	return uncompSpanBuf, nil
+	return nil
 }
 
 func (m *SpanManager) getEndCompressedOffset(spanID compression.SpanID) compression.Offset {
@@ -514,6 +524,7 @@ func (m *SpanManager) getEndUncompressedOffset(spanID compression.SpanID) compre
 	return end
 }
 
+// Close closes both the underlying zinfo data and blob cache.
 func (m *SpanManager) Close() {
 	m.index.Close()
 	m.cache.Close()

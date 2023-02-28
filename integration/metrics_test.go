@@ -127,7 +127,7 @@ func TestOverlayFallbackMetric(t *testing.T) {
 
 			imgInfo := dockerhub(tc.image)
 
-			sh.X("ctr", "i", "pull", imgInfo.ref)
+			sh.X("nerdctl", "pull", "-q", imgInfo.ref)
 			indexDigest := tc.indexDigestFn(sh, imgInfo)
 
 			sh.X("soci", "image", "rpull", "--soci-index-digest", indexDigest, imgInfo.ref)
@@ -196,7 +196,7 @@ log_fuse_operations = true
 			rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false, tcpMetricsConfig, logFuseOperationConfig))
 
 			imgInfo := dockerhub(tc.image)
-			sh.X("ctr", "i", "pull", imgInfo.ref)
+			sh.X("nerdctl", "pull", "-q", imgInfo.ref)
 			indexDigest := tc.indexDigestFn(t, sh, imgInfo)
 
 			sh.X("soci", "image", "rpull", "--soci-index-digest", indexDigest, imgInfo.ref)
@@ -217,16 +217,6 @@ fuse_metrics_emit_wait_duration_sec = 10
 	sh, done := newShellWithRegistry(t, newRegistryConfig())
 	defer done()
 
-	checkMetricExists := func(output, metric string) bool {
-		lines := strings.Split(output, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, metric) {
-				return true
-			}
-		}
-		return false
-	}
-
 	testCases := []struct {
 		name  string
 		image string
@@ -242,11 +232,11 @@ fuse_metrics_emit_wait_duration_sec = 10
 			rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false, tcpMetricsConfig, snapshotterConfig))
 
 			imgInfo := dockerhub(tc.image)
-			sh.X("ctr", "i", "pull", imgInfo.ref)
+			sh.X("nerdctl", "pull", "-q", imgInfo.ref)
 			indexDigest := buildIndex(sh, imgInfo)
 
 			sh.X("soci", "image", "rpull", "--soci-index-digest", indexDigest, imgInfo.ref)
-			sh.XLog("ctr", "run", "--rm", "-d", "--snapshotter=soci", imgInfo.ref, "test", "echo", "hi")
+			sh.XLog("ctr", "run", "-d", "--snapshotter=soci", imgInfo.ref, "test", "echo", "hi")
 
 			curlOutput := string(sh.O("curl", tcpMetricsAddress+metricsPath))
 
@@ -259,6 +249,55 @@ fuse_metrics_emit_wait_duration_sec = 10
 			time.Sleep(10 * time.Second)
 			curlOutput = string(sh.O("curl", tcpMetricsAddress+metricsPath))
 			for _, m := range layer.FuseOpsList {
+				if !checkMetricExists(curlOutput, m) {
+					t.Fatalf("missing expected metric: %s", m)
+				}
+			}
+		})
+	}
+
+}
+
+func TestBackgroundFetchMetrics(t *testing.T) {
+	const backgroundFetchConfig = `
+[background_fetch]
+silence_period_msec = 1000
+fetch_period_msec = 100
+emit_metric_period_sec = 2
+	`
+
+	bgFetchMetricsToCheck := []string{
+		commonmetrics.BackgroundFetchWorkQueueSize,
+		commonmetrics.BackgroundSpanFetchCount,
+	}
+
+	sh, done := newShellWithRegistry(t, newRegistryConfig())
+	defer done()
+
+	testCases := []struct {
+		name  string
+		image string
+	}{
+		{
+			name:  "drupal image",
+			image: drupalImage,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false, tcpMetricsConfig, backgroundFetchConfig))
+
+			imgInfo := dockerhub(tc.image)
+			sh.X("nerdctl", "pull", "-q", imgInfo.ref)
+			indexDigest := buildIndex(sh, imgInfo)
+
+			sh.X("soci", "image", "rpull", "--soci-index-digest", indexDigest, imgInfo.ref)
+			sh.XLog("ctr", "run", "-d", "--snapshotter=soci", imgInfo.ref, "test", "echo", "hi")
+
+			time.Sleep(5 * time.Second)
+			curlOutput := string(sh.O("curl", tcpMetricsAddress+metricsPath))
+			for _, m := range bgFetchMetricsToCheck {
 				if !checkMetricExists(curlOutput, m) {
 					t.Fatalf("missing expected metric: %s", m)
 				}
@@ -360,4 +399,14 @@ func checkFuseOperationFailureMetrics(t *testing.T, output string, metricToCheck
 		t.Fatalf("incorrect fuse operation failure metrics. metric: %s, total operation failure count: %d, expect fuse operation failure: %t",
 			metricToCheck, metricCountSum, expectOpFailure)
 	}
+}
+
+func checkMetricExists(output, metric string) bool {
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, metric) {
+			return true
+		}
+	}
+	return false
 }

@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -146,23 +147,24 @@ func TestOptimizeConsistentSociArtifact(t *testing.T) {
 }
 
 func TestLazyPullWithSparseIndex(t *testing.T) {
+	imageName := rabbitmqImage
+
 	regConfig := newRegistryConfig()
 
 	sh, done := newShellWithRegistry(t, regConfig)
 	defer done()
 
-	const imageName = "rethinkdb@sha256:4452aadba3e99771ff3559735dab16279c5a352359d79f38737c6fdca941c6e5"
-	const imageManifestDigest = "sha256:4452aadba3e99771ff3559735dab16279c5a352359d79f38737c6fdca941c6e5"
-	const minLayerSize = 10000000
-
 	rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false))
+
+	_, minLayerSize, _ := middleSizeLayerInfo(t, sh, dockerhub(imageName))
+
 	copyImage(sh, dockerhub(imageName), regConfig.mirror(imageName))
 	indexDigest := buildIndex(sh, regConfig.mirror(imageName), withMinLayerSize(minLayerSize))
 
 	fromNormalSnapshotter := func(image string) tarPipeExporter {
 		return func(t *testing.T, tarExportArgs ...string) {
 			rebootContainerd(t, sh, "", "")
-			sh.X("ctr", "i", "pull", "--user", regConfig.creds(), image)
+			sh.X("nerdctl", "pull", "-q", image)
 			sh.Pipe(nil, shell.C("ctr", "run", "--rm", image, "test", "tar", "-zc", "/usr"), tarExportArgs)
 		}
 	}
@@ -171,6 +173,10 @@ func TestLazyPullWithSparseIndex(t *testing.T) {
 		sh.Pipe(nil, shell.C("soci", "run", "--rm", "--snapshotter=soci", image, "test", "tar", "-zc", "/usr"), tarExportArgs)
 	}
 
+	imageManifestDigest, err := getManifestDigest(sh, dockerhub(imageName).ref, dockerhub(imageName).platform)
+	if err != nil {
+		t.Fatalf("Failed to get manifest digest: %v", err)
+	}
 	imageManifestJSON := fetchContentByDigest(sh, imageManifestDigest)
 	imageManifest := new(ocispec.Manifest)
 	if err := json.Unmarshal(imageManifestJSON, imageManifest); err != nil {
@@ -253,7 +259,7 @@ func TestLazyPull(t *testing.T) {
 	fromNormalSnapshotter := func(image string) tarPipeExporter {
 		return func(t *testing.T, tarExportArgs ...string) {
 			rebootContainerd(t, sh, "", "")
-			sh.X("ctr", "i", "pull", "--user", regConfig.creds(), image)
+			sh.X("nerdctl", "pull", "-q", image)
 			sh.Pipe(nil, shell.C("ctr", "run", "--rm", image, "test", "tar", "-zc", "/usr"), tarExportArgs)
 		}
 	}
@@ -332,7 +338,7 @@ func TestLazyPullNoIndexDigest(t *testing.T) {
 	fromNormalSnapshotter := func(image string) tarPipeExporter {
 		return func(t *testing.T, tarExportArgs ...string) {
 			rebootContainerd(t, sh, "", "")
-			sh.X("ctr", "i", "pull", "--user", regConfig.creds(), image)
+			sh.X("nerdctl", "pull", "-q", image)
 			sh.Pipe(nil, shell.C("ctr", "run", "--rm", image, "test", "tar", "-zc", "/usr"), tarExportArgs)
 		}
 	}
@@ -399,7 +405,7 @@ func TestPullWithAribtraryBlobInvalidZtocFormat(t *testing.T) {
 	fromNormalSnapshotter := func(image string) tarPipeExporter {
 		return func(t *testing.T, tarExportArgs ...string) {
 			rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false))
-			sh.X("ctr", "i", "pull", "--user", regConfig.creds(), image)
+			sh.X("nerdctl", "pull", "-q", image)
 			sh.Pipe(nil, shell.C("ctr", "run", "--rm", image, "test", "tar", "-zc", "/usr"), tarExportArgs)
 		}
 	}
@@ -513,7 +519,7 @@ disable = true
 	fromNormalSnapshotter := func(image string) tarPipeExporter {
 		return func(t *testing.T, tarExportArgs ...string) {
 			rebootContainerd(t, sh, "", "")
-			sh.X("ctr", "i", "pull", "--user", regConfig.creds(), image)
+			sh.X("nerdctl", "pull", "-q", image)
 			sh.Pipe(nil, shell.C("ctr", "run", "--rm", image, "test", "tar", "-zc", "/usr"), tarExportArgs)
 		}
 	}
@@ -673,7 +679,7 @@ insecure = true
 	//       we added "check_always = true" to the configuration in the above.
 	//       We use this behaviour for testing mirroring & refleshing functionality.
 	rebootContainerd(t, sh, "", "")
-	sh.X("ctr", "i", "pull", "--user", regConfig.creds(), regConfig.mirror(imageName).ref)
+	sh.X("nerdctl", "pull", "-q", regConfig.mirror(imageName).ref)
 	sh.X("soci", "create", regConfig.mirror(imageName).ref)
 	sh.X("soci", "image", "rpull", "--user", regConfig.creds(), "--soci-index-digest", indexDigest, regConfig.mirror(imageName).ref)
 	registryHostIP, registryAltHostIP := getIP(t, sh, regConfig.host), getIP(t, sh, regAltConfig.host)
@@ -766,38 +772,28 @@ func TestRpullImageThenRemove(t *testing.T) {
 
 // TestRpullImageWithMinLayerSize pulls and rpulls an image with a runtime min_layer_size to confirm small layers are mounted locally
 func TestRpullImageWithMinLayerSize(t *testing.T) {
-	const minLayerSize = "25000000"
-	const minLayerSizeConfig = `
-[snapshotter]
-min_layer_size=` + minLayerSize + `
-`
+	containerImage := rabbitmqImage
 
 	regConfig := newRegistryConfig()
 	sh, done := newShellWithRegistry(t, regConfig)
 	defer done()
 
+	// Start soci with default config
+	rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false))
+
+	middleIndex, middleSize, layerCount := middleSizeLayerInfo(t, sh, dockerhub(containerImage))
+
+	minLayerSizeConfig := `
+[snapshotter]
+min_layer_size=` + strconv.FormatInt(middleSize, 10) + `
+`
+	// Start soci with config to test
 	rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false, minLayerSizeConfig))
 
-	containerImage := rabbitmqImage
-
 	copyImage(sh, dockerhub(containerImage), regConfig.mirror(containerImage))
-	// withMinLayerSize(0) creates ztoc for all 10 layers instead of the 3 that are >= 10MB
 	indexDigest := buildIndex(sh, regConfig.mirror(containerImage), withMinLayerSize(0))
-
-	rawJSON := sh.O("soci", "index", "info", indexDigest)
-	var sociIndex soci.Index
-	if err := json.Unmarshal(rawJSON, &sociIndex); err != nil {
-		t.Fatalf("invalid soci index from digest %s: %v", indexDigest, rawJSON)
-	}
-
-	if len(sociIndex.Blobs) == 0 {
-		t.Fatalf("soci index %s contains 0 blobs, invalidating this test", indexDigest)
-	}
 
 	sh.X("soci", "image", "rpull", "--user", regConfig.creds(), "--soci-index-digest", indexDigest, regConfig.mirror(containerImage).ref)
 
-	// default index creation min layer size of 10MB would produce 3 fuse mounts
-	// specified index creation min layer size of 0 would produce 10 fuse mounts
-	// specified runtime min layer size of 25MB will produce 2 fuse mounts
-	checkFuseMounts(t, sh, 2)
+	checkFuseMounts(t, sh, layerCount-middleIndex)
 }

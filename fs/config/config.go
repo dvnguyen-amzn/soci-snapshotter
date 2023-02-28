@@ -61,8 +61,8 @@ type Config struct {
 	DisableVerification            bool   `toml:"disable_verification"`
 	MaxConcurrency                 int64  `toml:"max_concurrency"`
 	NoPrometheus                   bool   `toml:"no_prometheus"`
-	MountTimeoutSec                int    `toml:"mount_timeout_sec"`
-	FuseMetricsEmitWaitDurationSec int    `toml:"fuse_metrics_emit_wait_duration_sec"`
+	MountTimeoutSec                int64  `toml:"mount_timeout_sec"`
+	FuseMetricsEmitWaitDurationSec int64  `toml:"fuse_metrics_emit_wait_duration_sec"`
 
 	// BlobConfig is config for layer blob management.
 	BlobConfig `toml:"blob"`
@@ -81,11 +81,11 @@ type BlobConfig struct {
 	FetchTimeoutSec      int64 `toml:"fetching_timeout_sec"`
 	ForceSingleRangeMode bool  `toml:"force_single_range_mode"`
 	MaxRetries           int   `toml:"max_retries"`
-	MinWaitMSec          int   `toml:"min_wait_msec"`
-	MaxWaitMSec          int   `toml:"max_wait_msec"`
+	MinWaitMsec          int64 `toml:"min_wait_msec"`
+	MaxWaitMsec          int64 `toml:"max_wait_msec"`
 
-	// MaxSpanVerificationRetries defines the number of times fetch will be invoked in case of
-	// span verification failure.
+	// MaxSpanVerificationRetries defines the number of additional times fetch
+	// will be invoked in case of span verification failure.
 	MaxSpanVerificationRetries int `toml:"max_span_verification_retries"`
 }
 
@@ -114,16 +114,20 @@ type FuseConfig struct {
 type BackgroundFetchConfig struct {
 	Disable bool `toml:"disable"`
 
-	// SilencePeriodMSec defines the time (in ms) the background fetcher
+	// SilencePeriodMsec defines the time (in ms) the background fetcher
 	// will be paused for when a new image is mounted.
-	SilencePeriodMSec int64 `toml:"silence_period_msec"`
+	SilencePeriodMsec int64 `toml:"silence_period_msec"`
 
-	// FetchPeriodMSec specifies how often a background fetch will occur.
-	// The background fetcher will fetch one span every FetchPeriodMSec.
-	FetchPeriodMSec int64 `toml:"fetch_period_msec"`
+	// FetchPeriodMsec specifies how often a background fetch will occur.
+	// The background fetcher will fetch one span every FetchPeriodMsec.
+	FetchPeriodMsec int64 `toml:"fetch_period_msec"`
 
 	// MaxQueueSize specifies the maximum size of the work queue
 	// i.e., the maximum number of span managers that can be queued
 	// in the background fetcher.
 	MaxQueueSize int `toml:"max_queue_size"`
+
+	// EmitMetricPeriodSec is the amount of interval (in second) at which the background
+	// fetcher emits metrics
+	EmitMetricPeriodSec int64 `toml:"emit_metric_period_sec"`
 }

@@ -45,6 +45,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -70,8 +71,8 @@ const (
 	containerdBlobStorePath      = "/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256"
 	// Registry images to use in the test infrastructure. These are not intended to be used
 	// as images in the test itself, but just when we're setting up docker compose.
-	oci11RegistryImage = "ghcr.io/oci-playground/registry:v3.0.0-alpha.1"
-	oci10RegistryImage = "docker.io/library/registry:2"
+	oci11RegistryImage = "ghcr:soci_test"
+	oci10RegistryImage = "registry2:soci_test"
 )
 
 // These are images that we use in our integration tests
@@ -92,6 +93,16 @@ const proxySnapshotterConfig = `
 
 const containerdConfigTemplate = `
 version = 2
+
+disabled_plugins = [
+	"io.containerd.snapshotter.v1.aufs",
+	"io.containerd.snapshotter.v1.btrfs",
+	"io.containerd.snapshotter.v1.devmapper",
+	"io.containerd.snapshotter.v1.zfs",
+	"io.containerd.tracing.processor.v1.otlp",
+	"io.containerd.internal.v1.tracing",
+	"io.containerd.grpc.v1.cri",
+]
 
 [plugins."io.containerd.snapshotter.v1.soci"]
 root_path = "/var/lib/soci-snapshotter-grpc/"
@@ -115,7 +126,7 @@ const composeDefaultTemplate = `
 version: "3.7"
 services:
   testing:
-   image: soci_integ_test 
+   image: soci_base:soci_test
    privileged: true
    init: true
    entrypoint: [ "sleep", "infinity" ]
@@ -132,7 +143,7 @@ const composeRegistryTemplate = `
 version: "3.7"
 services:
  {{.ServiceName}}:
-  image: soci_integ_test
+  image: soci_base:soci_test
   privileged: true
   init: true
   entrypoint: [ "sleep", "infinity" ]
@@ -162,7 +173,7 @@ const composeRegistryAltTemplate = `
 version: "3.7"
 services:
   {{.ServiceName}}:
-    image: soci_integ_test
+    image: soci_base:soci_test
     privileged: true
     init: true
     entrypoint: [ "sleep", "infinity" ]
@@ -175,7 +186,7 @@ services:
     volumes:
     - /dev/fuse:/dev/fuse
   registry:
-    image: ghcr.io/oci-playground/registry:v3.0.0-alpha.1
+    image: ghcr:soci_test
     container_name: {{.RegistryHost}}
     environment:
     - REGISTRY_AUTH=htpasswd
@@ -187,7 +198,7 @@ services:
     volumes:
     - {{.AuthDir}}:/auth:ro
   registry-alt:
-    image: registry:2
+    image: registry2:soci_test
     container_name: {{.RegistryAltHost}}
 `
 
@@ -195,27 +206,35 @@ const composeBuildTemplate = `
 version: "3.7"
 services:
  {{.ServiceName}}:
-  image: soci_integ_test
+  image: soci_base:soci_test
   build:
    context: {{.ImageContextDir}}
    target: {{.TargetStage}}
    args:
     - SNAPSHOTTER_BUILD_FLAGS="-race"
  registry:
-  image: ghcr.io/oci-playground/registry:v3.0.0-alpha.1
+  image: ghcr:soci_test
+  build:
+   context: {{.ImageContextDir}}
+   target: {{.Registry3Alpha1Stage}}
  registry-alt:
-  image: registry:2
+  image: registry2:soci_test
+  build:
+   context: {{.ImageContextDir}}
+   target: {{.Registry2Stage}}
 `
 
 type dockerComposeYaml struct {
-	ServiceName      string
-	ImageContextDir  string
-	TargetStage      string
-	RegistryHost     string
-	RegistryImageRef string
-	RegistryAltHost  string
-	AuthDir          string
-	NetworkConfig    string
+	ServiceName          string
+	ImageContextDir      string
+	TargetStage          string
+	Registry2Stage       string
+	Registry3Alpha1Stage string
+	RegistryHost         string
+	RegistryImageRef     string
+	RegistryAltHost      string
+	AuthDir              string
+	NetworkConfig        string
 }
 
 // getContainerdConfigToml creates a containerd config yaml, by appending all
@@ -303,15 +322,13 @@ func dockerhub(name string, opts ...imageOpt) imageInfo {
 	return i
 }
 
-func encodeImageInfo(ii ...imageInfo) [][]string {
+// encodeImageInfoNerdctl assembles command line options for pulling or pushing an image using nerdctl
+func encodeImageInfoNerdctl(ii ...imageInfo) [][]string {
 	var opts [][]string
 	for _, i := range ii {
 		var o []string
-		if i.creds != "" {
-			o = append(o, "-u", i.creds)
-		}
 		if i.plainHTTP {
-			o = append(o, "--plain-http")
+			o = append(o, "--insecure-registry")
 		}
 		o = append(o, i.ref)
 		opts = append(opts, o)
@@ -320,11 +337,11 @@ func encodeImageInfo(ii ...imageInfo) [][]string {
 }
 
 func copyImage(sh *shell.Shell, src, dst imageInfo) {
-	opts := encodeImageInfo(src, dst)
+	opts := encodeImageInfoNerdctl(src, dst)
 	sh.
-		X(append([]string{"ctr", "i", "pull", "--platform", platforms.Format(src.platform)}, opts[0]...)...).
+		X(append([]string{"nerdctl", "pull", "-q", "--platform", platforms.Format(src.platform)}, opts[0]...)...).
 		X("ctr", "i", "tag", src.ref, dst.ref).
-		X(append([]string{"ctr", "i", "push", "--platform", platforms.Format(src.platform)}, opts[1]...)...)
+		X(append([]string{"nerdctl", "push", "--platform", platforms.Format(src.platform)}, opts[1]...)...)
 }
 
 type registryConfig struct {
@@ -522,7 +539,7 @@ func newSnapshotterBaseShell(t *testing.T) (*shell.Shell, func() error) {
 	}
 	sh := shell.New(de, testutil.NewTestingReporter(t))
 	if !isTestingBuiltinSnapshotter() {
-		if err := testutil.WriteFileContents(sh, defaultContainerdConfigPath, []byte(proxySnapshotterConfig), 0600); err != nil {
+		if err := testutil.WriteFileContents(sh, defaultContainerdConfigPath, []byte(getContainerdConfigToml(t, false)), 0600); err != nil {
 			t.Fatalf("failed to write containerd config %v: %v", defaultContainerdConfigPath, err)
 		}
 	}
@@ -541,7 +558,7 @@ func generateRegistrySelfSignedCert(registryHost string) (crt, key []byte, _ err
 		SerialNumber:          serialNumber,
 		Subject:               pkix.Name{CommonName: registryHost},
 		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		NotAfter:              time.Now().AddDate(1, 0, 0), // one year
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:              []string{registryHost},
@@ -676,45 +693,52 @@ func checkOverlayFallbackCount(output string, expected int) error {
 	return nil
 }
 
-// setup can be used to initialize things before integration tests start (as of now it only builds the services used by the integration tests so they can be referenced)
-func setup() ([]func() error, error) {
-	var (
-		serviceName = "testing"
-		targetStage = "containerd-snapshotter-base"
-	)
-	pRoot, err := testutil.GetProjectRoot()
+// middleSizeLayerInfo finds a layer not the smallest or largest (if possible), returns index, size, and layer count
+// It requires containerd to be running
+func middleSizeLayerInfo(t *testing.T, sh *shell.Shell, image imageInfo) (int, int64, int) {
+	sh.O("nerdctl", "pull", "-q", "--platform", platforms.Format(image.platform), image.ref)
+
+	imageManifestDigest, err := getManifestDigest(sh, image.ref, image.platform)
 	if err != nil {
-		return nil, err
+		t.Fatalf("Failed to get manifest digest: %v", err)
 	}
-	buildArgs, err := getBuildArgsFromEnv()
-	if err != nil {
-		return nil, err
-	}
-
-	composeYaml, err := testutil.ApplyTextTemplate(composeBuildTemplate, dockerComposeYaml{
-		ServiceName:     serviceName,
-		ImageContextDir: pRoot,
-		TargetStage:     targetStage,
-	})
-	if err != nil {
-		return nil, err
-	}
-	cOpts := []compose.Option{
-		compose.WithBuildArgs(buildArgs...),
-		compose.WithStdio(testutil.TestingLogDest()),
+	imageManifestJSON := fetchContentByDigest(sh, imageManifestDigest)
+	imageManifest := new(spec.Manifest)
+	if err := json.Unmarshal(imageManifestJSON, imageManifest); err != nil {
+		t.Fatalf("cannot unmarshal image manifest: %v", err)
 	}
 
-	return compose.Build(composeYaml, cOpts...)
+	snapshotSizes := make([]int64, 0)
+	for _, layerBlob := range imageManifest.Layers {
+		snapshotSizes = append(snapshotSizes, layerBlob.Size)
+	}
 
-}
-
-// teardown takes a list of cleanup functions and executes them after integration tests have ended
-func teardown(cleanups []func() error) error {
-	for i := 0; i < len(cleanups); i++ {
-		err := cleanups[i]()
-		if err != nil {
-			return err
+	sort.Slice(snapshotSizes, func(i, j int) bool { return snapshotSizes[i] < snapshotSizes[j] })
+	if snapshotSizes[0] == snapshotSizes[len(snapshotSizes)-1] {
+		// This condition would almost certainly invalidate the expected behavior of the calling test
+		t.Fatalf("all %v layers are the same size (%v) when seeking middle size layer", len(snapshotSizes), snapshotSizes[0])
+	}
+	middleIndex := len(snapshotSizes) / 2
+	middleSize := snapshotSizes[middleIndex]
+	if snapshotSizes[0] == middleSize {
+		// if the middle is also the smallest, find the next larger layer
+		for middleIndex < len(snapshotSizes)-1 && snapshotSizes[middleIndex] == middleSize {
+			middleIndex++
+		}
+	} else {
+		// find the lowest index that is the same size as the middle
+		for middleIndex > 0 && snapshotSizes[middleIndex-1] == middleSize {
+			middleIndex--
 		}
 	}
-	return nil
+
+	return middleIndex, middleSize, len(snapshotSizes)
+}
+
+func fetchContentFromPath(sh *shell.Shell, path string) []byte {
+	return sh.O("cat", path)
+}
+
+func fetchContentByDigest(sh *shell.Shell, digest string) []byte {
+	return sh.O("ctr", "content", "get", digest)
 }
