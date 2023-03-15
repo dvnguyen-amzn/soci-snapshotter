@@ -33,6 +33,7 @@
 package integration
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -54,9 +55,9 @@ const (
 // indexBuildConfig represents the values of the CLI flags that should be used
 // when creating an index with `buildIndex`
 type indexBuildConfig struct {
-	spanSize              int64
-	minLayerSize          int64
-	supportLegacyRegistry bool
+	spanSize                int64
+	minLayerSize            int64
+	supportArtifactRegistry bool
 }
 
 // indexBuildOption is a functional argument to update `indexBuildConfig`
@@ -77,8 +78,9 @@ func withMinLayerSize(minLayerSize int64) indexBuildOption {
 	}
 }
 
-func withLegacyRegistrySupport(ibc *indexBuildConfig) {
-	ibc.supportLegacyRegistry = true
+// withOCIArtifactRegistrySupport sets the SOCI index to built as an artifact manifest
+func withOCIArtifactRegistrySupport(ibc *indexBuildConfig) {
+	ibc.supportArtifactRegistry = true
 }
 
 // defaultIndexBuildConfig is the default parameters when creating and index with `buildIndex`
@@ -104,8 +106,8 @@ func buildIndex(sh *shell.Shell, src imageInfo, opt ...indexBuildOption) string 
 		"--span-size", fmt.Sprintf("%d", indexBuildConfig.spanSize),
 		"--platform", platforms.Format(src.platform),
 	}
-	if indexBuildConfig.supportLegacyRegistry {
-		createArgs = append(createArgs, "--legacy-registry")
+	if indexBuildConfig.supportArtifactRegistry {
+		createArgs = append(createArgs, "--manifest-type", "artifact")
 	}
 
 	indexDigest := sh.
@@ -118,10 +120,9 @@ func buildIndex(sh *shell.Shell, src imageInfo, opt ...indexBuildOption) string 
 }
 
 func validateSociIndex(sh *shell.Shell, sociIndex soci.Index, imgManifestDigest string, includedLayers map[string]struct{}) error {
-	if sociIndex.MediaType != ocispec.MediaTypeArtifactManifest {
-		return fmt.Errorf("unexpected index media type; expected = %v, got = %v", ocispec.MediaTypeArtifactManifest, sociIndex.MediaType)
+	if sociIndex.MediaType != ocispec.MediaTypeArtifactManifest && sociIndex.MediaType != ocispec.MediaTypeImageManifest {
+		return fmt.Errorf("unexpected index media type; expected types: [%v, %v], got: %v", ocispec.MediaTypeArtifactManifest, ocispec.MediaTypeImageManifest, sociIndex.MediaType)
 	}
-
 	if sociIndex.ArtifactType != soci.SociIndexArtifactType {
 		return fmt.Errorf("unexpected index artifact type; expected = %v, got = %v", soci.SociIndexArtifactType, sociIndex.ArtifactType)
 	}
@@ -168,9 +169,12 @@ func validateSociIndex(sh *shell.Shell, sociIndex soci.Index, imgManifestDigest 
 	return nil
 }
 
+// getSociLocalStoreContentDigest will generate a digest based on the contents of the soci content store
+// Files that are smaller than 10 bytes wil not be included when generating the digest
 func getSociLocalStoreContentDigest(sh *shell.Shell) digest.Digest {
-	content := sh.O("ls", blobStorePath)
-	return digest.FromBytes(content)
+	content := new(bytes.Buffer)
+	sh.Pipe(nil, []string{"find", blobStorePath, "-maxdepth", "1", "-type", "f", "-size", "+10c"}).Pipe(content, []string{"sort"})
+	return digest.FromBytes(content.Bytes())
 }
 
 func sociIndexFromDigest(sh *shell.Shell, indexDigest string) (index soci.Index, err error) {

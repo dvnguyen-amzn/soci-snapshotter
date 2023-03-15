@@ -23,7 +23,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/awslabs/soci-snapshotter/compression"
+	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -81,7 +81,7 @@ func (tb TocBuilder) TocFromFile(algorithm, filename string) (TOC, compression.O
 		return TOC{}, 0, err
 	}
 
-	return TOC{Metadata: fm}, uncompressedArchiveSize, nil
+	return TOC{FileMetadata: fm}, uncompressedArchiveSize, nil
 }
 
 // getFileMetadata creates `FileMetadata` for each file within the compressed file

@@ -44,11 +44,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/awslabs/soci-snapshotter/metadata/db"
+	"github.com/awslabs/soci-snapshotter/metadata"
 )
 
 func TestLayer(t *testing.T) {
-	TestSuiteLayer(t, db.NewDbMetadataStore)
+	testNodeRead(t, metadata.NewTempDbStore)
+	testExistence(t, metadata.NewTempDbStore)
 }
 
 func TestWaiter(t *testing.T) {

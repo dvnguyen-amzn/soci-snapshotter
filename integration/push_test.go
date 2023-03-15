@@ -17,10 +17,12 @@
 package integration
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/awslabs/soci-snapshotter/soci"
+
 	"github.com/containerd/containerd/platforms"
 )
 
@@ -56,10 +58,11 @@ func TestSociArtifactsPushAndPull(t *testing.T) {
 			copyImage(sh, dockerhub(imageName, withPlatform(platform)), regConfig.mirror(imageName, withPlatform(platform)))
 			indexDigest := buildIndex(sh, regConfig.mirror(imageName, withPlatform(platform)), withMinLayerSize(0))
 			artifactsStoreContentDigest := getSociLocalStoreContentDigest(sh)
+
 			sh.X("soci", "push", "--user", regConfig.creds(), "--platform", tt.Platform, regConfig.mirror(imageName).ref)
 			sh.X("rm", "-rf", "/var/lib/soci-snapshotter-grpc/content/blobs/sha256")
-
 			sh.X("soci", "image", "rpull", "--user", regConfig.creds(), "--soci-index-digest", indexDigest, "--platform", tt.Platform, regConfig.mirror(imageName).ref)
+
 			artifactsStoreContentDigestAfterRPull := getSociLocalStoreContentDigest(sh)
 
 			if artifactsStoreContentDigest != artifactsStoreContentDigestAfterRPull {
@@ -110,9 +113,8 @@ func TestPushAlwaysMostRecentlyCreatedIndex(t *testing.T) {
 			for _, opt := range tc.opts {
 				index := buildIndex(sh, regConfig.mirror(tc.image), withMinLayerSize(opt.minLayerSize), withSpanSize(opt.spanSize))
 				index = strings.Split(index, "\n")[0]
-				out := sh.O("soci", "push", "--user", regConfig.creds(), regConfig.mirror(tc.image).ref, "-q")
+				out := sh.O("soci", "push", "--existing-index", "allow", "--user", regConfig.creds(), regConfig.mirror(tc.image).ref, "-q")
 				pushedIndex := strings.Trim(string(out), "\n")
-
 				if index != pushedIndex {
 					t.Fatalf("incorrect index pushed to remote registry; expected %s, got %s", index, pushedIndex)
 				}
@@ -123,34 +125,34 @@ func TestPushAlwaysMostRecentlyCreatedIndex(t *testing.T) {
 
 func TestLegacyOCI(t *testing.T) {
 	tests := []struct {
-		name                  string
-		registryImage         string
-		supportLegacyRegistry bool
-		expectError           bool
+		name                    string
+		registryImage           string
+		supportArtifactRegistry bool
+		expectError             bool
 	}{
 		{
-			name:                  "OCI 1.1 Artifacts succeed with OCI 1.1 registry",
-			registryImage:         oci11RegistryImage,
-			supportLegacyRegistry: false,
-			expectError:           false,
+			name:                    "OCI 1.1 Artifacts succeed with OCI 1.1 registry",
+			registryImage:           oci11RegistryImage,
+			supportArtifactRegistry: true,
+			expectError:             false,
 		},
 		{
-			name:                  "OCI 1.0 Artifacts succeed with OCI 1.1 registry",
-			registryImage:         oci11RegistryImage,
-			supportLegacyRegistry: true,
-			expectError:           false,
+			name:                    "OCI 1.0 Artifacts succeed with OCI 1.1 registry",
+			registryImage:           oci11RegistryImage,
+			supportArtifactRegistry: false,
+			expectError:             false,
 		},
 		{
-			name:                  "OCI 1.1 Artifacts fail with OCI 1.0 registry",
-			registryImage:         oci10RegistryImage,
-			supportLegacyRegistry: false,
-			expectError:           true,
+			name:                    "OCI 1.1 Artifacts fail with OCI 1.0 registry",
+			registryImage:           oci10RegistryImage,
+			supportArtifactRegistry: true,
+			expectError:             true,
 		},
 		{
-			name:                  "OCI 1.0 Artifacts succeed with OCI 1.0 registry",
-			registryImage:         oci10RegistryImage,
-			supportLegacyRegistry: true,
-			expectError:           false,
+			name:                    "OCI 1.0 Artifacts succeed with OCI 1.0 registry",
+			registryImage:           oci10RegistryImage,
+			supportArtifactRegistry: false,
+			expectError:             false,
 		},
 	}
 
@@ -165,11 +167,11 @@ func TestLegacyOCI(t *testing.T) {
 
 			imageName := ubuntuImage
 			copyImage(sh, dockerhub(imageName), regConfig.mirror(imageName))
-			var buildOpts []indexBuildOption
-			if tc.supportLegacyRegistry {
-				buildOpts = append(buildOpts, withLegacyRegistrySupport)
-			}
 
+			var buildOpts []indexBuildOption
+			if tc.supportArtifactRegistry {
+				buildOpts = append(buildOpts, withOCIArtifactRegistrySupport)
+			}
 			indexDigest := buildIndex(sh, regConfig.mirror(imageName), buildOpts...)
 			rawJSON := sh.O("soci", "index", "info", indexDigest)
 			var sociIndex soci.Index
@@ -191,6 +193,126 @@ func TestLegacyOCI(t *testing.T) {
 				t.Fatalf("failed to rpull: %v", err)
 			}
 			checkFuseMounts(t, sh, len(sociIndex.Blobs))
+		})
+	}
+}
+
+func TestPushWithExistingIndices(t *testing.T) {
+	t.Parallel()
+	regConfig := newRegistryConfig()
+	sh, done := newShellWithRegistry(t, regConfig)
+	defer done()
+
+	rebootContainerd(t, sh, getContainerdConfigToml(t, false), getSnapshotterConfigToml(t, false))
+
+	images := []string{nginxImage, rabbitmqImage, drupalImage, ubuntuImage}
+	const (
+		singleFoundMessage   = "soci index found in remote repository with digest:"
+		multipleFoundMessage = "multiple soci indices found in remote repository:"
+		skipMessageTail      = "skipping pushing artifacts for image manifest:"
+		warnMessageHead      = "[WARN]"
+		warnMessageTail      = "pushing index anyway"
+	)
+	imageToIndexDigest := make(map[string]string)
+	imageToManifestDigest := make(map[string]string)
+	for _, img := range images {
+		mirrorImg := regConfig.mirror(img)
+		copyImage(sh, dockerhub(img), mirrorImg)
+		indexDigest := buildIndex(sh, mirrorImg)
+		manifestDigest, err := getManifestDigest(sh, mirrorImg.ref, mirrorImg.platform)
+		if err != nil {
+			t.Fatal(err)
+		}
+		imageToIndexDigest[img] = indexDigest
+		imageToManifestDigest[mirrorImg.ref] = manifestDigest
+
+		sh.X("soci", "push", "--user", regConfig.creds(), mirrorImg.ref)
+		if img == ubuntuImage {
+			buildIndex(sh, mirrorImg, withSpanSize(1280))
+			sh.X("soci", "push", "--user", regConfig.creds(), mirrorImg.ref)
+		}
+
+	}
+
+	tests := []struct {
+		name               string
+		imgInfo            imageInfo
+		imgName            string
+		cmd                []string
+		hasOutput          bool
+		outputContains     string
+		expectedIndexCount int
+	}{
+		{
+			name:               "Warn with existing index",
+			imgInfo:            regConfig.mirror(nginxImage),
+			imgName:            "nginx",
+			cmd:                []string{"soci", "push", "--user", regConfig.creds(), "--existing-index", "warn"},
+			hasOutput:          true,
+			outputContains:     fmt.Sprintf("%s %s %s: %s", warnMessageHead, singleFoundMessage, imageToIndexDigest[nginxImage], warnMessageTail),
+			expectedIndexCount: 2,
+		},
+		{
+			name:               "Skip with existing index",
+			imgInfo:            regConfig.mirror(rabbitmqImage),
+			imgName:            "rabbitmq",
+			cmd:                []string{"soci", "push", "--user", regConfig.creds(), "--existing-index", "skip"},
+			hasOutput:          true,
+			outputContains:     fmt.Sprintf("%s %s: %s %s", singleFoundMessage, imageToIndexDigest[rabbitmqImage], skipMessageTail, imageToManifestDigest[regConfig.mirror(rabbitmqImage).ref]),
+			expectedIndexCount: 1,
+		},
+
+		{
+			name:               "Allow with existing index",
+			imgInfo:            regConfig.mirror(drupalImage),
+			imgName:            "drupal",
+			cmd:                []string{"soci", "push", "--user", regConfig.creds(), "--existing-index", "allow"},
+			expectedIndexCount: 2,
+		},
+		{
+			name:               "Warn with multiple existing indices",
+			imgInfo:            regConfig.mirror(ubuntuImage),
+			imgName:            "ubuntu",
+			cmd:                []string{"soci", "push", "--user", regConfig.creds(), "--existing-index", "warn"},
+			hasOutput:          true,
+			outputContains:     fmt.Sprintf("%s %s %s", warnMessageHead, multipleFoundMessage, warnMessageTail),
+			expectedIndexCount: 3,
+		},
+	}
+	verifyOutput := func(given, expected string) error {
+		if !strings.Contains(given, expected) {
+			return fmt.Errorf("output: %s does not contain substring %s", given, expected)
+		}
+		return nil
+	}
+	verifyIndexCount := func(imgName, digest string, expected int) error {
+		index, err := getReferrers(sh, regConfig, imgName, digest)
+		if err != nil {
+			return err
+		}
+		if len(index.Manifests) != expected {
+			return fmt.Errorf("unexpected index count in remote: expected: %v; got: %v", expected, len(index.Manifests))
+		}
+		return nil
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc := tc
+			digest := imageToManifestDigest[tc.imgInfo.ref]
+			buildIndex(sh, tc.imgInfo, withSpanSize(1<<19))
+			tc.cmd = append(tc.cmd, tc.imgInfo.ref)
+			output, err := sh.OLog(tc.cmd...)
+			if err != nil {
+				t.Fatalf("unexpected error for test case: %v", err)
+			}
+			if tc.hasOutput {
+				if err = verifyOutput(string(output), tc.outputContains); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = verifyIndexCount(tc.imgName, strings.TrimSpace(digest), tc.expectedIndexCount); err != nil {
+				t.Fatal(err)
+			}
 		})
 	}
 }

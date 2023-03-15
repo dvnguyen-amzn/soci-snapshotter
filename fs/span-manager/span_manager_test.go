@@ -26,9 +26,9 @@ import (
 	"testing"
 
 	"github.com/awslabs/soci-snapshotter/cache"
-	"github.com/awslabs/soci-snapshotter/compression"
 	"github.com/awslabs/soci-snapshotter/util/testutil"
 	"github.com/awslabs/soci-snapshotter/ztoc"
+	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 )
 
 func init() {
@@ -81,7 +81,7 @@ func TestSpanManager(t *testing.T) {
 				testutil.File(fileName, string(fileContent)),
 			}
 
-			toc, r, err := ztoc.BuildZtocReader(tarEntries, gzip.BestCompression, int64(spanSize))
+			toc, r, err := ztoc.BuildZtocReader(t, tarEntries, gzip.BestCompression, int64(spanSize))
 			if err != nil {
 				err = fmt.Errorf("failed to create ztoc: %w", err)
 				return
@@ -107,7 +107,7 @@ func TestSpanManager(t *testing.T) {
 
 			// Test resolving all spans
 			var i compression.SpanID
-			for i = 0; i <= toc.CompressionInfo.MaxSpanID; i++ {
+			for i = 0; i <= toc.MaxSpanID; i++ {
 				err := m.resolveSpan(i)
 				if err != nil {
 					t.Fatalf("error resolving span %d. error: %v", i, err)
@@ -115,7 +115,7 @@ func TestSpanManager(t *testing.T) {
 			}
 
 			// Test resolveSpan returning ErrExceedMaxSpan for span id larger than max span id
-			resolveSpanErr := m.resolveSpan(toc.CompressionInfo.MaxSpanID + 1)
+			resolveSpanErr := m.resolveSpan(toc.MaxSpanID + 1)
 			if !errors.Is(resolveSpanErr, ErrExceedMaxSpan) {
 				t.Fatalf("failed returning ErrExceedMaxSpan for span id larger than max span id")
 			}
@@ -129,7 +129,7 @@ func TestSpanManagerCache(t *testing.T) {
 	tarEntries := []testutil.TarEntry{
 		testutil.File("span-manager-cache-test", string(content)),
 	}
-	toc, r, err := ztoc.BuildZtocReader(tarEntries, gzip.BestCompression, int64(spanSize))
+	toc, r, err := ztoc.BuildZtocReader(t, tarEntries, gzip.BestCompression, int64(spanSize))
 	if err != nil {
 		t.Fatalf("failed to create ztoc: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestStateTransition(t *testing.T) {
 	tarEntries := []testutil.TarEntry{
 		testutil.File("set-span-test", string(content)),
 	}
-	toc, r, err := ztoc.BuildZtocReader(tarEntries, gzip.BestCompression, int64(spanSize))
+	toc, r, err := ztoc.BuildZtocReader(t, tarEntries, gzip.BestCompression, int64(spanSize))
 	if err != nil {
 		t.Fatalf("failed to create ztoc: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestStateTransition(t *testing.T) {
 	m := New(toc, r, cache, 0)
 
 	// check initial span states
-	for i := uint32(0); i <= uint32(toc.CompressionInfo.MaxSpanID); i++ {
+	for i := uint32(0); i <= uint32(toc.MaxSpanID); i++ {
 		state := m.spans[i].state.Load().(spanState)
 		if state != unrequested {
 			t.Fatalf("failed initializing span states to Unrequested")
@@ -215,12 +215,12 @@ func TestStateTransition(t *testing.T) {
 		},
 		{
 			name:      "max span - bgfetch",
-			spanID:    m.ztoc.CompressionInfo.MaxSpanID,
+			spanID:    m.ztoc.MaxSpanID,
 			isBgFetch: true,
 		},
 		{
 			name:   "max span - on demand fetch",
-			spanID: m.ztoc.CompressionInfo.MaxSpanID,
+			spanID: m.ztoc.MaxSpanID,
 		},
 	}
 
@@ -350,7 +350,7 @@ func TestSpanManagerRetries(t *testing.T) {
 			entries := []testutil.TarEntry{
 				testutil.File("test", string(testutil.RandomByteData(10000000))),
 			}
-			ztoc, sr, err := ztoc.BuildZtocReader(entries, gzip.DefaultCompression, 100000)
+			ztoc, sr, err := ztoc.BuildZtocReader(t, entries, gzip.DefaultCompression, 100000)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -358,7 +358,7 @@ func TestSpanManagerRetries(t *testing.T) {
 			sr = io.NewSectionReader(rdr, 0, 10000000)
 			sm := New(ztoc, sr, cache.NewMemoryCache(), tc.spanManagerRetries)
 
-			for i := 0; i < int(ztoc.CompressionInfo.MaxSpanID); i++ {
+			for i := 0; i < int(ztoc.MaxSpanID); i++ {
 				rdr.errCount = 0
 
 				_, err := sm.fetchAndCacheSpan(compression.SpanID(i), true)

@@ -21,7 +21,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/awslabs/soci-snapshotter/compression"
+	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -37,7 +37,7 @@ type gzipZinfoBuilder struct{}
 // ZinfoFromFile creates zinfo for a gzip file. The underlying zinfo object (i.e. `GzipZinfo`)
 // is stored in `CompressionInfo.Checkpoints` as byte slice.
 func (gzb gzipZinfoBuilder) ZinfoFromFile(filename string, spanSize int64) (zinfo CompressionInfo, fs compression.Offset, err error) {
-	index, err := compression.NewGzipZinfoFromFile(filename, spanSize)
+	index, err := compression.NewZinfoFromFile(compression.Gzip, filename, spanSize)
 	if err != nil {
 		return
 	}
@@ -59,13 +59,14 @@ func (gzb gzipZinfoBuilder) ZinfoFromFile(filename string, spanSize int64) (zinf
 	}
 
 	return CompressionInfo{
-		MaxSpanID:   index.MaxSpanID(),
-		SpanDigests: digests,
-		Checkpoints: checkpoints,
+		MaxSpanID:            index.MaxSpanID(),
+		SpanDigests:          digests,
+		Checkpoints:          checkpoints,
+		CompressionAlgorithm: compression.Gzip,
 	}, fs, nil
 }
 
-func getPerSpanDigests(filename string, fileSize int64, index *compression.GzipZinfo) ([]digest.Digest, error) {
+func getPerSpanDigests(filename string, fileSize int64, index compression.Zinfo) ([]digest.Digest, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("could not open file for reading: %w", err)
@@ -76,20 +77,8 @@ func getPerSpanDigests(filename string, fileSize int64, index *compression.GzipZ
 	var i compression.SpanID
 	maxSpanID := index.MaxSpanID()
 	for i = 0; i <= maxSpanID; i++ {
-		var (
-			startOffset = index.SpanIDToCompressedOffset(i)
-			endOffset   compression.Offset
-		)
-
-		if index.HasBits(i) {
-			startOffset--
-		}
-
-		if i == maxSpanID {
-			endOffset = compression.Offset(fileSize)
-		} else {
-			endOffset = index.SpanIDToCompressedOffset(i + 1)
-		}
+		startOffset := index.StartCompressedOffset(i)
+		endOffset := index.EndCompressedOffset(i, compression.Offset(fileSize))
 
 		section := io.NewSectionReader(file, int64(startOffset), int64(endOffset-startOffset))
 		dgst, err := digest.FromReader(section)

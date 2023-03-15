@@ -50,7 +50,6 @@ import (
 
 	"github.com/awslabs/soci-snapshotter/fs"
 	"github.com/awslabs/soci-snapshotter/metadata"
-	dbmetadata "github.com/awslabs/soci-snapshotter/metadata/db"
 	"github.com/awslabs/soci-snapshotter/service"
 	"github.com/awslabs/soci-snapshotter/service/keychain/cri"
 	"github.com/awslabs/soci-snapshotter/service/keychain/dockerconfig"
@@ -120,7 +119,7 @@ func main() {
 		log.L.WithError(err).Fatal("failed to prepare logger")
 	}
 	if *printVersion {
-		fmt.Println("soci-snapshotter-grpc", version.Version, version.Revision)
+		fmt.Println("soci-snapshotter-grpc version", version.Version, version.Revision)
 		return
 	}
 	logrus.SetLevel(lvl)
@@ -137,6 +136,10 @@ func main() {
 	// Snapshotter should use "github.com/containerd/containerd/log" otherwize
 	// logs are always printed as "debug" mode.
 	golog.SetOutput(log.G(ctx).WriterLevel(logrus.DebugLevel))
+	log.G(ctx).WithFields(logrus.Fields{
+		"version":  version.Version,
+		"revision": version.Revision,
+	}).Info("starting soci-snapshotter-grpc")
 
 	// Get configuration from specified file
 	tree, err := toml.LoadFile(*configPath)
@@ -326,7 +329,7 @@ func getMetadataStore(rootDir string, config snapshotterConfig) (metadata.Store,
 			return nil, err
 		}
 		return func(sr *io.SectionReader, toc *ztoc.Ztoc, opts ...metadata.Option) (metadata.Reader, error) {
-			return dbmetadata.NewReader(db, sr, toc, opts...)
+			return metadata.NewReader(db, sr, toc, opts...)
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown metadata store type: %v; must be %v",

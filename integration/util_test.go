@@ -51,6 +51,7 @@ import (
 	"time"
 
 	commonmetrics "github.com/awslabs/soci-snapshotter/fs/metrics/common"
+	"github.com/awslabs/soci-snapshotter/util/dockershell"
 	shell "github.com/awslabs/soci-snapshotter/util/dockershell"
 	"github.com/awslabs/soci-snapshotter/util/dockershell/compose"
 	dexec "github.com/awslabs/soci-snapshotter/util/dockershell/exec"
@@ -113,7 +114,7 @@ check_always = true
 
 [debug]
 format = "json"
-level = "debug"
+level = "{{.LogLevel}}"
 
 {{.AdditionalConfig}}
 `
@@ -244,9 +245,11 @@ func getContainerdConfigToml(t *testing.T, disableVerification bool, additionalC
 		additionalConfigs = append(additionalConfigs, proxySnapshotterConfig)
 	}
 	s, err := testutil.ApplyTextTemplate(containerdConfigTemplate, struct {
+		LogLevel            string
 		DisableVerification bool
 		AdditionalConfig    string
 	}{
+		LogLevel:            containerdLogLevel,
 		DisableVerification: disableVerification,
 		AdditionalConfig:    strings.Join(additionalConfigs, "\n"),
 	})
@@ -607,6 +610,19 @@ func getManifestDigest(sh *shell.Shell, ref string, platform spec.Platform) (str
 	return "", fmt.Errorf("could not find manifest for %s for platform %s", ref, platforms.Format(platform))
 }
 
+func getReferrers(sh *dockershell.Shell, regConfig registryConfig, imgName, digest string) (*spec.Index, error) {
+	var index spec.Index
+	output, err := sh.OLog("curl", "-u", regConfig.creds(), fmt.Sprintf("https://%s:443/v2/%s/referrers/%s", regConfig.host, imgName, digest))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get referrers: %w", err)
+	}
+	err = json.Unmarshal(output, &index)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal index: %w", err)
+	}
+	return &index, nil
+}
+
 func rebootContainerd(t *testing.T, sh *shell.Shell, customContainerdConfig, customSnapshotterConfig string) *testutil.RemoteSnapshotMonitor {
 	var (
 		containerdRoot    = "/var/lib/containerd/"
@@ -633,12 +649,12 @@ func rebootContainerd(t *testing.T, sh *shell.Shell, customContainerdConfig, cus
 
 	// run containerd and snapshotter
 	var m *testutil.RemoteSnapshotMonitor
-	containerdCmds := shell.C("containerd", "--log-level", "debug")
+	containerdCmds := shell.C("containerd", "--log-level", containerdLogLevel)
 	if customContainerdConfig != "" {
 		containerdCmds = addConfig(t, sh, customContainerdConfig, containerdCmds...)
 	}
 	sh.Gox(containerdCmds...)
-	snapshotterCmds := shell.C("/usr/local/bin/soci-snapshotter-grpc", "--log-level", "debug",
+	snapshotterCmds := shell.C("/usr/local/bin/soci-snapshotter-grpc", "--log-level", sociLogLevel,
 		"--address", snapshotterSocket)
 	if customSnapshotterConfig != "" {
 		snapshotterCmds = addConfig(t, sh, customSnapshotterConfig, snapshotterCmds...)

@@ -21,10 +21,10 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/awslabs/soci-snapshotter/compression"
 	"github.com/awslabs/soci-snapshotter/fs/config"
 	"github.com/awslabs/soci-snapshotter/soci"
 	"github.com/awslabs/soci-snapshotter/ztoc"
+	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/urfave/cli"
@@ -86,21 +86,21 @@ var infoCommand = cli.Command{
 		if err != nil {
 			return err
 		}
-		gzInfo, err := compression.NewGzipZinfo(ztoc.CompressionInfo.Checkpoints)
+		gzInfo, err := compression.NewZinfo(compression.Gzip, ztoc.Checkpoints)
 		if err != nil {
 			return err
 		}
 
 		multiSpanFiles := 0
 		zinfo := Info{
-			Version:   ztoc.Version,
+			Version:   string(ztoc.Version),
 			BuildTool: ztoc.BuildToolIdentifier,
 			Size:      entry.Size,
 			SpanSize:  gzInfo.SpanSize(),
-			NumSpans:  ztoc.CompressionInfo.MaxSpanID + 1,
-			NumFiles:  len(ztoc.TOC.Metadata),
+			NumSpans:  ztoc.MaxSpanID + 1,
+			NumFiles:  len(ztoc.FileMetadata),
 		}
-		for _, v := range ztoc.TOC.Metadata {
+		for _, v := range ztoc.FileMetadata {
 			startSpan := gzInfo.UncompressedOffsetToSpanID(v.UncompressedOffset)
 			endSpan := gzInfo.UncompressedOffsetToSpanID(v.UncompressedOffset + v.UncompressedSize)
 			if startSpan != endSpan {

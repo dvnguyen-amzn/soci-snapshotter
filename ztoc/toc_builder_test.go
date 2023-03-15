@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/awslabs/soci-snapshotter/util/testutil"
+	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -55,14 +56,14 @@ func TestTocBuilder(t *testing.T) {
 	}{
 		{
 			name:          "TocBuilder supports gzip",
-			algorithm:     CompressionGzip,
+			algorithm:     compression.Gzip,
 			tarEntries:    tarEntries,
 			makeTarReader: gzipTarReader,
 			expectErr:     false,
 		},
 		{
 			name:          "TocBuilder supports zstd",
-			algorithm:     CompressionZstd,
+			algorithm:     compression.Zstd,
 			tarEntries:    tarEntries,
 			makeTarReader: zstdTarReader,
 			expectErr:     false,
@@ -76,7 +77,7 @@ func TestTocBuilder(t *testing.T) {
 		},
 		{
 			name:          "TocBuilder returns error if given tar file and algorithm mismatch",
-			algorithm:     CompressionZstd,
+			algorithm:     compression.Zstd,
 			tarEntries:    tarEntries,
 			makeTarReader: gzipTarReader,
 			expectErr:     true,
@@ -84,8 +85,8 @@ func TestTocBuilder(t *testing.T) {
 	}
 
 	builder := NewTocBuilder()
-	builder.RegisterTarProvider(CompressionGzip, TarProviderGzip)
-	builder.RegisterTarProvider(CompressionZstd, TarProviderZstd)
+	builder.RegisterTarProvider(compression.Gzip, TarProviderGzip)
+	builder.RegisterTarProvider(compression.Zstd, TarProviderZstd)
 
 	for _, tt := range testCases {
 		tt := tt
@@ -102,8 +103,8 @@ func TestTocBuilder(t *testing.T) {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			} else {
-				if len(toc.Metadata) != len(tt.tarEntries) {
-					t.Fatalf("count of file metadata mismatch, expect: %d, actual: %d", len(tt.tarEntries), len(toc.Metadata))
+				if len(toc.FileMetadata) != len(tt.tarEntries) {
+					t.Fatalf("count of file metadata mismatch, expect: %d, actual: %d", len(tt.tarEntries), len(toc.FileMetadata))
 				}
 			}
 		})

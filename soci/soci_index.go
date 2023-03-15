@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/awslabs/soci-snapshotter/ztoc"
+	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/log"
@@ -50,8 +51,6 @@ const (
 	IndexAnnotationImageLayerDigest = "com.amazon.soci.image-layer-digest"
 	// IndexAnnotationBuildToolIdentifier is the index annotation for build tool identifier
 	IndexAnnotationBuildToolIdentifier = "com.amazon.soci.build-tool-identifier"
-	// OCIArtifactManifestMediaType is the media type for OCI Artifact manifest
-	OCIArtifactManifestMediaType = "application/vnd.oci.artifact.manifest.v1+json"
 
 	defaultSpanSize            = int64(1 << 22) // 4MiB
 	defaultMinLayerSize        = 10 << 20       // 10MiB
@@ -153,7 +152,7 @@ func fromManifest(manifest ocispec.Manifest, index *Index) {
 // The JSON blob will be either an OCI 1.1 Artifact or
 // an OCI 1.0 Manifest, depending on how the index was created.
 func MarshalIndex(i *Index) ([]byte, error) {
-	if i.MediaType == OCIArtifactManifestMediaType {
+	if i.MediaType == ocispec.MediaTypeArtifactManifest {
 		return marshalIndexAs11Artifact(i)
 	}
 	return marshalIndexAs10Manifest(i)
@@ -177,18 +176,21 @@ func marshalIndexAs10Manifest(i *Index) ([]byte, error) {
 }
 
 // GetIndexDescriptorCollection returns all `IndexDescriptorInfo` of the given image and platforms.
-func GetIndexDescriptorCollection(ctx context.Context, cs content.Store, artifactsDb *ArtifactsDb, img images.Image, ps []ocispec.Platform) ([]IndexDescriptorInfo, error) {
-	descriptors := []IndexDescriptorInfo{}
-	var entries []ArtifactEntry
+func GetIndexDescriptorCollection(ctx context.Context, cs content.Store, artifactsDb *ArtifactsDb, img images.Image, ps []ocispec.Platform) ([]IndexDescriptorInfo, *ocispec.Descriptor, error) {
+	var (
+		descriptors []IndexDescriptorInfo
+		entries     []ArtifactEntry
+		indexDesc   *ocispec.Descriptor
+		err         error
+	)
 	for _, platform := range ps {
-		indexDesc, err := GetImageManifestDescriptor(ctx, cs, img.Target, platforms.OnlyStrict(platform))
+		indexDesc, err = GetImageManifestDescriptor(ctx, cs, img.Target, platforms.OnlyStrict(platform))
 		if err != nil {
-			return descriptors, err
+			return nil, nil, err
 		}
-
 		e, err := artifactsDb.getIndexArtifactEntries(indexDesc.Digest.String())
 		if err != nil {
-			return descriptors, err
+			return nil, nil, err
 		}
 		entries = append(entries, e...)
 	}
@@ -209,7 +211,7 @@ func GetIndexDescriptorCollection(ctx context.Context, cs content.Store, artifac
 		})
 	}
 
-	return descriptors, nil
+	return descriptors, indexDesc, nil
 }
 
 type buildConfig struct {
@@ -218,11 +220,23 @@ type buildConfig struct {
 	buildToolIdentifier string
 	artifactsDb         *ArtifactsDb
 	platform            ocispec.Platform
-	legacyRegistry      bool
+	artifactRegistry    bool
+}
+type indexConfig struct {
+	artifact bool
 }
 
 // BuildOption specifies a config change to build soci indices.
 type BuildOption func(c *buildConfig) error
+
+// IndexOption specifies a config change for index creation.
+type IndexOption func(c *indexConfig) error
+
+// WithIndexAsArtifact sets whether to build SOCI index as an artifact manifest instead of an image manifest.
+func WithIndexAsArtifact(c *indexConfig) error {
+	c.artifact = true
+	return nil
+}
 
 // WithSpanSize specifies span size.
 func WithSpanSize(spanSize int64) BuildOption {
@@ -256,13 +270,10 @@ func WithPlatform(platform ocispec.Platform) BuildOption {
 	}
 }
 
-// WithLegacyRegistrySupport sets whether the SOCI Index should be built for legacy registries.
-// OCI 1.1 added support for associating artifacts such as SOCI indices with images. There is a
-// mechanism to emulate this behavior with OCI 1.0 registries by pretending that the SOCI index
-// is itself an image. This option should only be use if the SOCI index will be pushed to a
-// registry which does not support OCI 1.1 features.
-func WithLegacyRegistrySupport(c *buildConfig) error {
-	c.legacyRegistry = true
+// WithOCIArtifactRegistrySupport sets whether to build SOCI index as an artifact manifest instead of an image
+// manifest. Artifact manifests are proposed within the OCI 1.1 spec and are only supported by OCI 1.1 compatible registries.
+func WithOCIArtifactRegistrySupport(c *buildConfig) error {
+	c.artifactRegistry = true
 	return nil
 }
 
@@ -356,7 +367,11 @@ func (b *IndexBuilder) Build(ctx context.Context, img images.Image) (*IndexWithM
 		Size:        imgManifestDesc.Size,
 		Annotations: imgManifestDesc.Annotations,
 	}
-	index := NewIndex(ztocsDesc, refers, annotations, b.config.legacyRegistry)
+	var indexOpts []IndexOption
+	if b.config.artifactRegistry {
+		indexOpts = append(indexOpts, WithIndexAsArtifact)
+	}
+	index := NewIndex(ztocsDesc, refers, annotations, indexOpts...)
 	return &IndexWithMetadata{
 		Index:       index,
 		Platform:    &b.config.platform,
@@ -377,13 +392,13 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 		return nil, nil
 	}
 
-	compression, err := images.DiffCompression(ctx, desc.MediaType)
+	compressionAlgo, err := images.DiffCompression(ctx, desc.MediaType)
 	if err != nil {
 		return nil, fmt.Errorf("could not determine layer compression: %w", err)
 	}
-	if compression != ztoc.CompressionGzip {
+	if compressionAlgo != compression.Gzip {
 		return nil, fmt.Errorf("layer %s (%s) must be compressed by gzip, but got %q: %w",
-			desc.Digest, desc.MediaType, compression, errUnsupportedLayerFormat)
+			desc.Digest, desc.MediaType, compressionAlgo, errUnsupportedLayerFormat)
 	}
 
 	ra, err := b.contentStore.ReaderAt(ctx, desc)
@@ -406,7 +421,7 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 		return nil, errors.New("the size of the temp file doesn't match that of the layer")
 	}
 
-	toc, err := b.ztocBuilder.BuildZtoc(tmpFile.Name(), b.config.spanSize, ztoc.WithCompression(compression))
+	toc, err := b.ztocBuilder.BuildZtoc(tmpFile.Name(), b.config.spanSize, ztoc.WithCompression(compressionAlgo))
 	if err != nil {
 		return nil, err
 	}
@@ -448,10 +463,14 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 }
 
 // NewIndex returns a new index.
-func NewIndex(blobs []ocispec.Descriptor, subject *ocispec.Descriptor, annotations map[string]string, legacy bool) *Index {
-	mediaType := OCIArtifactManifestMediaType
-	if legacy {
-		mediaType = ocispec.MediaTypeImageManifest
+func NewIndex(blobs []ocispec.Descriptor, subject *ocispec.Descriptor, annotations map[string]string, opts ...IndexOption) *Index {
+	ic := new(indexConfig)
+	for _, opt := range opts {
+		opt(ic)
+	}
+	mediaType := ocispec.MediaTypeImageManifest
+	if ic.artifact {
+		mediaType = ocispec.MediaTypeArtifactManifest
 	}
 	return &Index{
 		Blobs:        blobs,

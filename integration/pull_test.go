@@ -443,11 +443,11 @@ func TestPullWithAribtraryBlobInvalidZtocFormat(t *testing.T) {
 		}
 
 		index := soci.Index{
-			MediaType:    soci.OCIArtifactManifestMediaType,
+			MediaType:    ocispec.MediaTypeArtifactManifest,
 			ArtifactType: soci.SociIndexArtifactType,
 			Blobs:        ztocDescs,
 			Subject: &ocispec.Descriptor{
-				MediaType: soci.OCIArtifactManifestMediaType,
+				MediaType: ocispec.MediaTypeArtifactManifest,
 				Digest:    digest.Digest(imgDigest),
 				Size:      int64(len(imgBytes)),
 			},

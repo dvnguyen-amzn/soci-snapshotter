@@ -107,7 +107,7 @@ func TestBackgroundFetcherRun(t *testing.T) {
 
 			var infos []testInfo
 			for _, entries := range tc.entries {
-				ztoc, sr, err := ztoc.BuildZtocReader(entries, gzip.DefaultCompression, 1000000)
+				ztoc, sr, err := ztoc.BuildZtocReader(t, entries, gzip.DefaultCompression, 1000000)
 				if err != nil {
 					t.Fatalf("error building span manager and section reader: %v", err)
 				}
@@ -133,8 +133,8 @@ func TestBackgroundFetcherRun(t *testing.T) {
 			for _, info := range infos {
 				info.cache.mu.Lock()
 				defer info.cache.mu.Unlock()
-				if info.cache.addCount != int(info.ztoc.CompressionInfo.MaxSpanID)+1 {
-					t.Fatalf("unexpected number of adds to cache; expected %d, got %d", info.ztoc.CompressionInfo.MaxSpanID+1, info.cache.addCount)
+				if info.cache.addCount != int(info.ztoc.MaxSpanID)+1 {
+					t.Fatalf("unexpected number of adds to cache; expected %d, got %d", info.ztoc.MaxSpanID+1, info.cache.addCount)
 				}
 
 				// The first 10 bytes of a compressed gzip archive is the gzip header.

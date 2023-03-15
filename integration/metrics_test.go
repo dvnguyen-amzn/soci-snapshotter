@@ -86,7 +86,7 @@ func TestMetrics(t *testing.T) {
 }
 
 func TestOverlayFallbackMetric(t *testing.T) {
-	sh, done := newShellWithRegistry(t, newRegistryConfig())
+	sh, done := newSnapshotterBaseShell(t)
 	defer done()
 
 	testCases := []struct {
@@ -146,15 +146,15 @@ func TestFuseOperationFailureMetrics(t *testing.T) {
 log_fuse_operations = true
 `
 
-	sh, done := newShellWithRegistry(t, newRegistryConfig())
+	sh, done := newSnapshotterBaseShell(t)
 	defer done()
 
 	manipulateZtocMetadata := func(zt *ztoc.Ztoc) {
-		for i, md := range zt.TOC.Metadata {
+		for i, md := range zt.FileMetadata {
 			md.UncompressedOffset += 2
 			md.UncompressedSize = math.MaxInt64
 			md.Xattrs = map[string]string{"foo": "bar"}
-			zt.TOC.Metadata[i] = md
+			zt.FileMetadata[i] = md
 		}
 	}
 
@@ -214,7 +214,7 @@ func TestFuseOperationCountMetrics(t *testing.T) {
 fuse_metrics_emit_wait_duration_sec = 10
 	`
 
-	sh, done := newShellWithRegistry(t, newRegistryConfig())
+	sh, done := newSnapshotterBaseShell(t)
 	defer done()
 
 	testCases := []struct {
@@ -271,7 +271,7 @@ emit_metric_period_sec = 2
 		commonmetrics.BackgroundSpanFetchCount,
 	}
 
-	sh, done := newShellWithRegistry(t, newRegistryConfig())
+	sh, done := newSnapshotterBaseShell(t)
 	defer done()
 
 	testCases := []struct {
@@ -351,11 +351,11 @@ func buildIndexByManipulatingZtocData(sh *shell.Shell, indexDigest string, manip
 	}
 
 	newIndex := soci.Index{
-		MediaType:    soci.OCIArtifactManifestMediaType,
+		MediaType:    ocispec.MediaTypeArtifactManifest,
 		ArtifactType: soci.SociIndexArtifactType,
 		Blobs:        ztocDescs,
 		Subject: &ocispec.Descriptor{
-			MediaType: soci.OCIArtifactManifestMediaType,
+			MediaType: ocispec.MediaTypeArtifactManifest,
 			Digest:    index.Subject.Digest,
 			Size:      index.Subject.Size,
 		},

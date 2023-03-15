@@ -43,7 +43,7 @@ func TestSequentialResolver(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ztoc, sr, err := ztoc.BuildZtocReader(tc.entries, gzip.DefaultCompression, 1000000)
+			ztoc, sr, err := ztoc.BuildZtocReader(t, tc.entries, gzip.DefaultCompression, 1000000)
 			if err != nil {
 				t.Fatalf("error build ztoc and section reader: %v", err)
 			}
@@ -64,8 +64,8 @@ func TestSequentialResolver(t *testing.T) {
 
 			lastSpanID := sequentialResolver.(*sequentialLayerResolver).nextSpanFetchID
 			// assert that we've resolved all spans
-			if lastSpanID != ztoc.CompressionInfo.MaxSpanID+1 {
-				t.Fatalf("unexpected number of spans resolved; expected %d, got %d", ztoc.CompressionInfo.MaxSpanID+1, lastSpanID)
+			if lastSpanID != ztoc.MaxSpanID+1 {
+				t.Fatalf("unexpected number of spans resolved; expected %d, got %d", ztoc.MaxSpanID+1, lastSpanID)
 			}
 
 			// assert that all spans are resolved sequentially
